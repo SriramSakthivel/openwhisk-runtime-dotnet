@@ -16,7 +16,10 @@
  */
 
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.IO.MemoryMappedFiles;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
@@ -24,95 +27,140 @@ using Newtonsoft.Json.Linq;
 
 namespace Apache.OpenWhisk.Runtime.Common
 {
-    public class Run
-    {
-        private readonly Type _type;
-        private readonly MethodInfo _method;
-        private readonly ConstructorInfo _constructor;
-        private readonly bool _awaitableMethod;
+  public class Run
+  {
+    private readonly Type _type;
+    private readonly MethodInfo _method;
+    private readonly ConstructorInfo _constructor;
+    private readonly bool _awaitableMethod;
+    private readonly string executablePath;
 
-        public Run(Type type, MethodInfo method, ConstructorInfo constructor, bool awaitableMethod)
+    public Run(Type type, MethodInfo method, ConstructorInfo constructor, bool awaitableMethod, string executablePath)
+    {
+      _type = type;
+      _method = method;
+      _constructor = constructor;
+      _awaitableMethod = awaitableMethod;
+      this.executablePath = executablePath;
+    }
+
+    public async Task HandleRequest(HttpContext httpContext)
+    {
+      if (_type == null || _method == null || _constructor == null)
+      {
+        await httpContext.Response.WriteError("Cannot invoke an uninitialized action.");
+        return;
+      }
+
+      try
+      {
+        string mmfName = Guid.NewGuid().ToString() + ".map";
+        string mmfPath = Path.Combine(Path.GetTempPath(), mmfName);
+        using (MemoryMappedFile mmf = MemoryMappedFile.CreateFromFile(mmfPath, FileMode.CreateNew, null, 10 * 1024))
         {
-            _type = type;
-            _method = method;
-            _constructor = constructor;
-            _awaitableMethod = awaitableMethod;
+          var process = Process.Start(new ProcessStartInfo()
+          {
+            UseShellExecute = false,
+            FileName = "dotnet",
+            ArgumentList =
+            {
+              executablePath,
+              mmfPath
+            }
+          });
+          process.WaitForExit();
+
+          JObject obj = new JObject();
+          obj.Add("exitCode", new JValue(process.ExitCode));
+
+          var mapStream = mmf.CreateViewStream();
+          StreamString streamString = new StreamString(mapStream);
+          string output = streamString.ReadString();
+          obj.Add("output", output);
+
+          await httpContext.Response.WriteResponse(200, obj.ToString());
         }
 
-        public async Task HandleRequest(HttpContext httpContext)
+        if (File.Exists(mmfPath))
         {
-            if (_type == null || _method == null || _constructor == null)
-            {
-                await httpContext.Response.WriteError("Cannot invoke an uninitialized action.");
-                return;
-            }
+          File.Delete(mmfPath);
+        }
+      }
+      catch (Exception ex)
+      {
+        await httpContext.Response.WriteError($"Process execute throws exception {ex}.");
+      }
+      return;
 
+
+      try
+      {
+        string body = await new StreamReader(httpContext.Request.Body).ReadToEndAsync();
+
+        JObject inputObject = string.IsNullOrEmpty(body) ? null : JObject.Parse(body);
+
+        JObject valObject = null;
+
+        if (inputObject != null)
+        {
+          valObject = inputObject["value"] as JObject;
+          foreach (JToken token in inputObject.Children())
+          {
             try
             {
-                string body = await new StreamReader(httpContext.Request.Body).ReadToEndAsync();
+              if (token.Path.Equals("value", StringComparison.InvariantCultureIgnoreCase))
+                continue;
+              string envKey = $"__OW_{token.Path.ToUpperInvariant()}";
+              string envVal = token.First.ToString();
+              Environment.SetEnvironmentVariable(envKey, envVal);
+              //Console.WriteLine($"Set environment variable \"{envKey}\" to \"{envVal}\".");
+            }
+            catch (Exception)
+            {
+              await Console.Error.WriteLineAsync(
+                  $"Unable to set environment variable for the \"{token.Path}\" token.");
+            }
+          }
+        }
 
-                JObject inputObject = string.IsNullOrEmpty(body) ? null : JObject.Parse(body);
+        object owObject = _constructor.Invoke(new object[] { });
 
-                JObject valObject = null;
+        try
+        {
+          JObject output;
 
-                if (inputObject != null)
-                {
-                    valObject = inputObject["value"] as JObject;
-                    foreach (JToken token in inputObject.Children())
-                    {
-                        try
-                        {
-                            if (token.Path.Equals("value", StringComparison.InvariantCultureIgnoreCase))
-                                continue;
-                            string envKey = $"__OW_{token.Path.ToUpperInvariant()}";
-                            string envVal = token.First.ToString();
-                            Environment.SetEnvironmentVariable(envKey, envVal);
-                            //Console.WriteLine($"Set environment variable \"{envKey}\" to \"{envVal}\".");
-                        }
-                        catch (Exception)
-                        {
-                            await Console.Error.WriteLineAsync(
-                                $"Unable to set environment variable for the \"{token.Path}\" token.");
-                        }
-                    }
-                }
+          if (_awaitableMethod)
+          {
+            output = (JObject)await (dynamic)_method.Invoke(owObject, new object[] { valObject });
+          }
+          else
+          {
+            output = (JObject)_method.Invoke(owObject, new object[] { valObject });
+          }
 
-                object owObject = _constructor.Invoke(new object[] { });
+          if (output == null)
+          {
+            await httpContext.Response.WriteError("The action returned null");
+            Console.Error.WriteLine("The action returned null");
+            return;
+          }
 
-                try
-                {
-                    JObject output;
-
-                    if(_awaitableMethod) {
-                        output = (JObject) await (dynamic) _method.Invoke(owObject, new object[] {valObject});
-                    }
-                    else {
-                        output = (JObject) _method.Invoke(owObject, new object[] {valObject});
-                    }
-
-                    if (output == null)
-                    {
-                        await httpContext.Response.WriteError("The action returned null");
-                        Console.Error.WriteLine("The action returned null");
-                        return;
-                    }
-
-                    await httpContext.Response.WriteResponse(200, output.ToString());
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine(ex.StackTrace);
-                    await httpContext.Response.WriteError(ex.Message
+          await httpContext.Response.WriteResponse(200, output.ToString());
+        }
+        catch (Exception ex)
+        {
+          Console.Error.WriteLine(ex.StackTrace);
+          await httpContext.Response.WriteError(ex.Message
 #if DEBUG
                                                           + ", " + ex.StackTrace
 #endif
                     );
-                }
-            }
-            finally
-            {
-                Startup.WriteLogMarkers();
-            }
         }
+      }
+      finally
+      {
+        Startup.WriteLogMarkers();
+      }
     }
+  }
 }
